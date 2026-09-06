@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ali Parser - Parsing Tracker
 // @namespace    https://github.com/menteora/ali-parser
-// @version      0.3.0
+// @version      0.3.1
 // @description  Aggiunge un checkbox persistente alle schede prodotto AliExpress per segnare articoli gia gestiti e parsati.
 // @author       menteora
 // @updateURL    https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
@@ -306,7 +306,7 @@
       control.type = 'button';
       control.setAttribute(UI_ATTR, 'card-check');
       control.className = 'ap-card-check';
-      control.innerHTML = '<span class="ap-checkmark">✓</span>';
+      control.innerHTML = '<span class="ap-checkmark"></span><span class="ap-card-label"></span>';
 
       const computed = getComputedStyle(card);
       if (computed.position === 'static') card.style.setProperty('position', 'relative', 'important');
@@ -338,6 +338,8 @@
   function updateCheckbox(control, key) {
     const record = getRecord(key);
     const info = statusInfo(record);
+    const checkmark = control.querySelector('.ap-checkmark');
+    const label = control.querySelector('.ap-card-label');
 
     control.className = `ap-card-check ${info.cls}`;
     control.title = record?.status === 'parsed'
@@ -349,7 +351,20 @@
           : 'Clicca per segnare questo articolo come gia gestito.';
 
     control.setAttribute('aria-label', info.label);
-    control.querySelector('.ap-checkmark').textContent = record?.status === 'parsed' || record?.status === 'flagged' ? '✓' : '';
+
+    if (record?.status === 'parsed') {
+      checkmark.textContent = '✓';
+      label.textContent = 'PARSATO';
+    } else if (record?.status === 'flagged') {
+      checkmark.textContent = '✓';
+      label.textContent = 'FLAG';
+    } else if (record?.lastOpenedAt) {
+      checkmark.textContent = '•';
+      label.textContent = 'VISTO';
+    } else {
+      checkmark.textContent = '';
+      label.textContent = '';
+    }
   }
 
   function collectCards() {
@@ -595,28 +610,30 @@
         top: 8px !important;
         right: 8px !important;
         z-index: 2147483000 !important;
-        width: 34px !important;
-        height: 34px !important;
         min-width: 34px !important;
-        padding: 0 !important;
+        height: 34px !important;
+        padding: 0 8px !important;
         border: 2px solid #111 !important;
         border-radius: 7px !important;
         background: rgba(255,255,255,.96) !important;
         box-shadow: 0 2px 10px rgba(0,0,0,.28) !important;
-        color: #fff !important;
+        color: #111 !important;
         cursor: pointer !important;
         display: flex !important;
         align-items: center !important;
         justify-content: center !important;
+        gap: 5px !important;
         pointer-events: auto !important;
-        font: 900 23px/1 Arial, sans-serif !important;
+        font: 900 12px/1 Arial, sans-serif !important;
+        white-space: nowrap !important;
       }
-      .ap-card-check:hover { transform: scale(1.08) !important; }
-      .ap-card-check.ap-flagged { background: #d47a00 !important; border-color: #9e5900 !important; }
-      .ap-card-check.ap-parsed { background: #16813f !important; border-color: #0d5f2c !important; }
-      .ap-card-check.ap-viewed { background: rgba(255,255,255,.96) !important; border-color: #2769ad !important; }
-      .ap-card-check.ap-new { background: rgba(255,255,255,.96) !important; border-color: #111 !important; }
-      .ap-checkmark { display: block !important; color: #fff !important; }
+      .ap-card-check:hover { transform: scale(1.05) !important; }
+      .ap-card-check.ap-new { width: 34px !important; padding: 0 !important; background: rgba(255,255,255,.96) !important; border-color: #111 !important; }
+      .ap-card-check.ap-flagged { background: #d47a00 !important; border-color: #9e5900 !important; color: #fff !important; }
+      .ap-card-check.ap-parsed { background: #16813f !important; border-color: #0d5f2c !important; color: #fff !important; }
+      .ap-card-check.ap-viewed { background: #fff !important; border-color: #2769ad !important; color: #2769ad !important; }
+      .ap-checkmark { display: block !important; font-size: 19px !important; line-height: 1 !important; color: currentColor !important; }
+      .ap-card-label { display: block !important; font-size: 10px !important; letter-spacing: .2px !important; color: currentColor !important; }
 
       .ap-toolbar {
         position: fixed !important;
