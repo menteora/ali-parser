@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Ali Parser - Parsing Tracker
 // @namespace    https://github.com/menteora/ali-parser
-// @version      0.1.0
+// @version      0.1.1
 // @description  Tiene traccia dei prodotti AliExpress gia aperti/parsati e permette di flaggarli manualmente nelle ricerche.
 // @author       menteora
+// @updateURL    https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
+// @downloadURL  https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
 // @match        https://aliexpress.com/*
 // @match        https://*.aliexpress.com/*
 // @grant        GM_getValue
