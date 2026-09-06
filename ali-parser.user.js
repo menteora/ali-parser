@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ali Parser - Parsing Tracker
 // @namespace    https://github.com/menteora/ali-parser
-// @version      0.3.1
-// @description  Aggiunge un checkbox persistente alle schede prodotto AliExpress per segnare articoli gia gestiti e parsati.
+// @version      0.4.0
+// @description  Mostra e salva lo stato degli articoli AliExpress anche nei suggerimenti dentro le pagine prodotto.
 // @author       menteora
 // @updateURL    https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
 // @downloadURL  https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
@@ -231,6 +231,8 @@
       '[class*="card-out-wrapper"]',
       '[class*="product-item"]',
       '[class*="productItem"]',
+      '[class*="recommend"]',
+      '[class*="Recommend"]',
       '[data-product-id]',
       '[data-item-id]',
     ];
@@ -368,17 +370,21 @@
   }
 
   function collectCards() {
-    if (isProductPage()) return new Set();
-
     const visibleKeys = new Set();
     const mountedCards = new WeakSet();
     const anchors = document.querySelectorAll('a[href]');
+    const current = isProductPage() ? currentIdentity() : null;
+    const currentKey = current?.key || null;
 
     for (const anchor of anchors) {
       if (anchor.closest(`[${UI_ATTR}]`)) continue;
 
       const identity = productIdentityFromAnchor(anchor);
       if (!identity) continue;
+
+      // Nella pagina prodotto non applicare il badge al prodotto principale.
+      // Gli altri link prodotto sono suggerimenti, correlati, sponsorizzati, ecc.
+      if (currentKey && identity.key === currentKey) continue;
 
       const card = findCard(anchor);
       if (!card) continue;
@@ -571,6 +577,7 @@
       const identity = currentIdentity();
       markCurrentOpened(identity);
       renderProductPanel();
+      collectCards();
       return;
     }
 
@@ -706,8 +713,8 @@
   function scheduleScan(delay = 300) {
     clearTimeout(state.scanTimer);
     state.scanTimer = setTimeout(() => {
+      const visibleKeys = collectCards();
       if (!isProductPage()) {
-        const visibleKeys = collectCards();
         renderToolbar(visibleKeys);
       }
     }, delay);
