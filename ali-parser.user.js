@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ali Parser - Parsing Tracker
 // @namespace    https://github.com/menteora/ali-parser
-// @version      0.2.0
-// @description  Tiene traccia dei prodotti AliExpress gia aperti/parsati e permette di flaggarli manualmente ovunque compaiano.
+// @version      0.3.0
+// @description  Aggiunge un checkbox persistente alle schede prodotto AliExpress per segnare articoli gia gestiti e parsati.
 // @author       menteora
 // @updateURL    https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
 // @downloadURL  https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
@@ -21,7 +21,7 @@
 
   const STORE_KEY = 'ali-parser:products:v1';
   const UI_ATTR = 'data-ali-parser-ui';
-  const CARD_ATTR = 'data-ali-parser-product-id';
+  const CARD_ATTR = 'data-ali-parser-key';
 
   const state = {
     currentUrl: location.href,
@@ -40,91 +40,155 @@
     GM_setValue(STORE_KEY, registry);
   }
 
-  function getRecord(productId) {
-    return loadRegistry()[productId] || null;
+  function getRecord(key) {
+    return loadRegistry()[key] || null;
   }
 
-  function patchRecord(productId, patch) {
+  function patchRecord(key, patch) {
     const registry = loadRegistry();
-    const previous = registry[productId] || { productId };
-    const next = {
+    const previous = registry[key] || { key };
+    registry[key] = {
       ...previous,
       ...patch,
-      productId,
+      key,
       updatedAt: Date.now(),
     };
-
-    registry[productId] = next;
     saveRegistry(registry);
     refreshUi();
-    return next;
+    return registry[key];
   }
 
-  function deleteRecord(productId) {
+  function deleteRecord(key) {
     const registry = loadRegistry();
-    delete registry[productId];
+    delete registry[key];
     saveRegistry(registry);
     refreshUi();
+  }
+
+  function safeDecode(value) {
+    let current = String(value || '');
+    for (let i = 0; i < 3; i += 1) {
+      try {
+        const decoded = decodeURIComponent(current);
+        if (decoded === current) break;
+        current = decoded;
+      } catch (_) {
+        break;
+      }
+    }
+    return current;
   }
 
   function extractProductId(input) {
     if (!input) return null;
 
-    const raw = String(input);
-    const variants = [raw];
+    const values = [String(input), safeDecode(input)];
+    const patterns = [
+      /\/item\/(\d{8,})(?:\.html)?/i,
+      /(?:productId|product_id|itemId|item_id)[=/:](\d{8,})/i,
+      /(?:productId|product_id|itemId|item_id)%3D(\d{8,})/i,
+      /\b(100\d{10,})\b/,
+    ];
 
-    try {
-      const decoded = decodeURIComponent(raw);
-      if (decoded !== raw) variants.push(decoded);
-    } catch (_) {
-      // URL non codificato correttamente: prosegui con il valore originale.
-    }
+    for (const value of values) {
+      for (const pattern of patterns) {
+        const match = value.match(pattern);
+        if (match) return match[1];
+      }
 
-    for (const value of variants) {
       try {
         const url = new URL(value, location.href);
-        const pathMatch = url.pathname.match(/\/item\/(\d{8,})(?:\.html)?/i);
-        if (pathMatch) return pathMatch[1];
-
-        const paramNames = ['productId', 'product_id', 'itemId', 'item_id'];
-        for (const name of paramNames) {
+        for (const name of ['productId', 'product_id', 'itemId', 'item_id']) {
           const candidate = url.searchParams.get(name);
           if (candidate && /^\d{8,}$/.test(candidate)) return candidate;
         }
+
+        for (const name of ['url', 'redirect', 'redirectUrl', 'target', 'targetUrl', 'to']) {
+          const nested = url.searchParams.get(name);
+          if (!nested) continue;
+          const nestedId = extractProductId(nested);
+          if (nestedId) return nestedId;
+        }
       } catch (_) {
-        // Fallback regex sotto.
+        // Continua con gli altri formati.
       }
-
-      const fallback = value.match(/(?:\/item\/|productId=|product_id=|itemId=|item_id=)(\d{8,})/i);
-      if (fallback) return fallback[1];
     }
 
     return null;
   }
 
-  function getElementProductId(element) {
-    if (!element) return null;
-
-    const attrs = [
-      element.getAttribute?.('data-product-id'),
-      element.getAttribute?.('data-item-id'),
-      element.dataset?.productId,
-      element.dataset?.itemId,
-      element.href,
-      element.getAttribute?.('href'),
-    ];
-
-    for (const value of attrs) {
-      const productId = extractProductId(value);
-      if (productId) return productId;
-      if (value && /^\d{8,}$/.test(String(value))) return String(value);
+  function hashString(value) {
+    let hash = 2166136261;
+    const text = String(value || '');
+    for (let i = 0; i < text.length; i += 1) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
     }
-
-    return null;
+    return (hash >>> 0).toString(36);
   }
 
-  function canonicalProductUrl(productId) {
-    return `${location.origin}/item/${productId}.html`;
+  function normalizeHref(href) {
+    try {
+      const url = new URL(href, location.href);
+      for (const name of [...url.searchParams.keys()]) {
+        if (/^(spm|gatewayAdapt|sourceType|channel|aff_|algo_|scm|pvid|utparam|businessType)/i.test(name)) {
+          url.searchParams.delete(name);
+        }
+      }
+      url.hash = '';
+      return url.toString();
+    } catch (_) {
+      return String(href || '');
+    }
+  }
+
+  function productIdentityFromAnchor(anchor) {
+    if (!anchor) return null;
+
+    const sources = [
+      anchor.href,
+      anchor.getAttribute('href'),
+      anchor.dataset?.productId,
+      anchor.dataset?.itemId,
+      anchor.getAttribute('data-product-id'),
+      anchor.getAttribute('data-item-id'),
+      anchor.outerHTML?.slice(0, 5000),
+    ].filter(Boolean);
+
+    let productId = null;
+    for (const source of sources) {
+      productId = extractProductId(source);
+      if (productId) break;
+    }
+
+    if (productId) {
+      return {
+        key: productId,
+        productId,
+        href: anchor.href || '',
+        fallback: false,
+      };
+    }
+
+    const href = normalizeHref(anchor.href || anchor.getAttribute('href') || '');
+    if (!href || !looksLikeProductHref(href)) return null;
+
+    return {
+      key: `url:${hashString(href)}`,
+      productId: null,
+      href,
+      fallback: true,
+    };
+  }
+
+  function looksLikeProductHref(href) {
+    const value = safeDecode(href).toLowerCase();
+    return value.includes('/item/') ||
+      value.includes('productid') ||
+      value.includes('itemid') ||
+      value.includes('/pdp/') ||
+      value.includes('product-detail') ||
+      /\b100\d{10,}\b/.test(value);
   }
 
   function currentProductId() {
@@ -132,53 +196,34 @@
   }
 
   function isProductPage() {
-    return Boolean(currentProductId());
+    return Boolean(currentProductId()) || /\/item\//i.test(location.pathname);
   }
 
-  function recordLabel(record) {
-    if (!record) return { text: 'NUOVO', symbol: '○', cls: 'ap-new' };
-    if (record.status === 'parsed') return { text: 'PARSATO', symbol: '✓', cls: 'ap-parsed' };
-    if (record.status === 'flagged') return { text: 'FLAG', symbol: '⚑', cls: 'ap-flagged' };
-    if (record.lastOpenedAt) return { text: 'VISTO', symbol: '●', cls: 'ap-viewed' };
-    return { text: 'NUOVO', symbol: '○', cls: 'ap-new' };
+  function visibleImageIn(node) {
+    const images = node.querySelectorAll?.('img') || [];
+    for (const image of images) {
+      const rect = image.getBoundingClientRect();
+      if (rect.width >= 70 && rect.height >= 70) return image;
+    }
+    return null;
   }
 
-  function countDistinctProducts(node, stopAfter = 3) {
-    const ids = new Set();
+  function countProductLinks(node, stopAfter = 3) {
+    const keys = new Set();
     const links = node.querySelectorAll?.('a[href]') || [];
 
     for (const link of links) {
-      const id = getElementProductId(link);
-      if (!id) continue;
-      ids.add(id);
-      if (ids.size >= stopAfter) break;
+      const identity = productIdentityFromAnchor(link);
+      if (!identity) continue;
+      keys.add(identity.key);
+      if (keys.size >= stopAfter) break;
     }
 
-    return ids.size;
+    return keys.size;
   }
 
-  function looksLikeProductCard(node, productId) {
-    if (!(node instanceof HTMLElement)) return false;
-    if (node === document.body || node === document.documentElement) return false;
-
-    const rect = node.getBoundingClientRect();
-    if (rect.width < 90 || rect.height < 90) return false;
-    if (rect.width > 720 || rect.height > 950) return false;
-
-    const image = node.querySelector('img');
-    if (!image) return false;
-
-    const idsInside = countDistinctProducts(node, 3);
-    if (idsInside > 2) return false;
-
-    const ownId = getElementProductId(node);
-    if (ownId && ownId !== productId) return false;
-
-    return true;
-  }
-
-  function findCard(anchor, productId) {
-    const preferredSelectors = [
+  function findCard(anchor) {
+    const preferred = [
       '.search-card-item',
       '[class*="search-card"]',
       '[class*="product-card"]',
@@ -190,162 +235,153 @@
       '[data-item-id]',
     ];
 
-    for (const selector of preferredSelectors) {
-      const found = anchor.closest(selector);
-      if (found && looksLikeProductCard(found, productId)) return found;
+    for (const selector of preferred) {
+      const node = anchor.closest(selector);
+      if (!node) continue;
+      const rect = node.getBoundingClientRect();
+      if (rect.width >= 90 && rect.height >= 90 && visibleImageIn(node)) return node;
     }
 
     let node = anchor;
     let best = null;
 
     for (let depth = 0; depth < 9 && node && node !== document.body; depth += 1, node = node.parentElement) {
-      if (!looksLikeProductCard(node, productId)) continue;
+      if (!(node instanceof HTMLElement)) continue;
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 90 || rect.height < 90 || rect.width > 700 || rect.height > 900) continue;
+      if (!visibleImageIn(node)) continue;
+
+      const productLinks = countProductLinks(node, 3);
+      if (productLinks > 2) continue;
+
       best = node;
-      break;
+      if (productLinks === 1 && rect.width >= 140 && rect.height >= 140) break;
     }
 
     if (best) return best;
 
-    // Ultimo fallback: il contenitore piu vicino con un'immagine, anche se AliExpress
-    // ha cambiato completamente le classi della card.
-    node = anchor;
-    for (let depth = 0; depth < 6 && node && node !== document.body; depth += 1, node = node.parentElement) {
-      if (!(node instanceof HTMLElement)) continue;
-      if (!node.querySelector('img')) continue;
-      const rect = node.getBoundingClientRect();
-      if (rect.width >= 80 && rect.height >= 80 && rect.width <= 800 && rect.height <= 1000) return node;
-    }
+    const image = anchor.querySelector('img');
+    if (image && anchor instanceof HTMLElement) return anchor;
 
     return null;
   }
 
-  function buildCardControls(card, productId) {
-    let controls = card.querySelector(`:scope > [${UI_ATTR}="card-controls"]`);
+  function statusInfo(record) {
+    if (!record) return { label: 'Nuovo', cls: 'ap-new' };
+    if (record.status === 'parsed') return { label: 'Parsato', cls: 'ap-parsed' };
+    if (record.status === 'flagged') return { label: 'Flag manuale', cls: 'ap-flagged' };
+    if (record.lastOpenedAt) return { label: 'Visto', cls: 'ap-viewed' };
+    return { label: 'Nuovo', cls: 'ap-new' };
+  }
 
-    if (!controls) {
-      controls = document.createElement('div');
-      controls.setAttribute(UI_ATTR, 'card-controls');
-      controls.className = 'ap-card-controls';
-      controls.innerHTML = `
-        <button type="button" class="ap-status" title="Stato prodotto"></button>
-        <button type="button" class="ap-flag" title="Flag manuale: considera questo articolo gia gestito">⚑</button>
-      `;
+  function toggleManualFlag(identity) {
+    const record = getRecord(identity.key);
 
-      const computed = getComputedStyle(card);
-      if (computed.position === 'static') card.style.position = 'relative';
-      card.appendChild(controls);
-
-      controls.querySelector('.ap-status').addEventListener('click', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation();
-
-        const record = getRecord(productId);
-        if (record?.status === 'parsed') {
-          const reset = confirm(`Prodotto ${productId} gia parsato. Vuoi azzerare lo stato?`);
-          if (reset) deleteRecord(productId);
-          return;
-        }
-
-        patchRecord(productId, {
-          status: 'parsed',
-          parsedAt: Date.now(),
-          parsedManually: true,
-          flaggedAt: null,
-          url: canonicalProductUrl(productId),
-        });
-      });
-
-      controls.querySelector('.ap-flag').addEventListener('click', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation();
-
-        const record = getRecord(productId);
-        if (record?.status === 'flagged') {
-          deleteRecord(productId);
-          return;
-        }
-
-        patchRecord(productId, {
-          status: 'flagged',
-          flaggedAt: Date.now(),
-          parsedAt: null,
-          parsedManually: false,
-          url: canonicalProductUrl(productId),
-        });
-      });
+    if (record?.status === 'parsed') {
+      const reset = confirm('Questo articolo risulta gia parsato. Vuoi togliere il check e azzerare lo stato?');
+      if (reset) deleteRecord(identity.key);
+      return;
     }
 
-    updateCardControls(card, productId);
+    if (record?.status === 'flagged') {
+      deleteRecord(identity.key);
+      return;
+    }
+
+    patchRecord(identity.key, {
+      productId: identity.productId,
+      status: 'flagged',
+      flaggedAt: Date.now(),
+      parsedAt: null,
+      href: identity.href,
+      identityFallback: identity.fallback,
+    });
   }
 
-  function updateCardControls(card, productId) {
-    const controls = card.querySelector(`:scope > [${UI_ATTR}="card-controls"]`);
-    if (!controls) return;
+  function mountCheckbox(card, identity) {
+    let control = card.querySelector(`:scope > [${UI_ATTR}="card-check"]`);
 
-    const record = getRecord(productId);
-    const label = recordLabel(record);
-    const statusButton = controls.querySelector('.ap-status');
-    const flagButton = controls.querySelector('.ap-flag');
+    if (!control) {
+      control = document.createElement('button');
+      control.type = 'button';
+      control.setAttribute(UI_ATTR, 'card-check');
+      control.className = 'ap-card-check';
+      control.innerHTML = '<span class="ap-checkmark">✓</span>';
 
-    statusButton.className = `ap-status ${label.cls}`;
-    statusButton.textContent = label.symbol;
-    statusButton.setAttribute('aria-label', label.text);
-    statusButton.title = record?.status === 'parsed'
-      ? 'Gia parsato. Clicca per azzerare lo stato.'
-      : record?.lastOpenedAt
-        ? 'Gia visto. Clicca per segnare come parsato.'
-        : 'Non ancora parsato. Clicca per segnare manualmente come parsato.';
+      const computed = getComputedStyle(card);
+      if (computed.position === 'static') card.style.setProperty('position', 'relative', 'important');
 
-    flagButton.classList.toggle('is-active', record?.status === 'flagged');
-    flagButton.title = record?.status === 'flagged'
-      ? 'Flag manuale attivo. Clicca per rimuoverlo.'
-      : 'Flag manuale: considera questo articolo gia gestito.';
+      control.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        const key = control.dataset.key;
+        const liveIdentity = {
+          key,
+          productId: control.dataset.productId || null,
+          href: control.dataset.href || '',
+          fallback: control.dataset.fallback === '1',
+        };
+        toggleManualFlag(liveIdentity);
+      }, true);
 
-    card.classList.toggle('ap-card-done', record?.status === 'parsed' || record?.status === 'flagged');
+      card.appendChild(control);
+    }
+
+    control.dataset.key = identity.key;
+    control.dataset.productId = identity.productId || '';
+    control.dataset.href = identity.href || '';
+    control.dataset.fallback = identity.fallback ? '1' : '0';
+    updateCheckbox(control, identity.key);
   }
 
-  function collectProductAnchors() {
+  function updateCheckbox(control, key) {
+    const record = getRecord(key);
+    const info = statusInfo(record);
+
+    control.className = `ap-card-check ${info.cls}`;
+    control.title = record?.status === 'parsed'
+      ? 'Gia parsato. Clicca per azzerare.'
+      : record?.status === 'flagged'
+        ? 'Flag manuale attivo. Clicca per rimuoverlo.'
+        : record?.lastOpenedAt
+          ? 'Gia visto. Clicca per mettere il check manuale.'
+          : 'Clicca per segnare questo articolo come gia gestito.';
+
+    control.setAttribute('aria-label', info.label);
+    control.querySelector('.ap-checkmark').textContent = record?.status === 'parsed' || record?.status === 'flagged' ? '✓' : '';
+  }
+
+  function collectCards() {
+    if (isProductPage()) return new Set();
+
+    const visibleKeys = new Set();
+    const mountedCards = new WeakSet();
     const anchors = document.querySelectorAll('a[href]');
-    const result = [];
 
     for (const anchor of anchors) {
       if (anchor.closest(`[${UI_ATTR}]`)) continue;
-      const productId = getElementProductId(anchor);
-      if (!productId) continue;
-      result.push({ anchor, productId });
-    }
 
-    return result;
-  }
+      const identity = productIdentityFromAnchor(anchor);
+      if (!identity) continue;
 
-  function scanProductCards() {
-    if (isProductPage()) return;
-
-    const found = collectProductAnchors();
-    const visibleIds = new Set();
-    const mountedIds = new Set();
-
-    for (const { anchor, productId } of found) {
-      visibleIds.add(productId);
-      if (mountedIds.has(productId)) continue;
-
-      const card = findCard(anchor, productId);
+      const card = findCard(anchor);
       if (!card) continue;
+      if (mountedCards.has(card)) continue;
 
-      const existingId = card.getAttribute(CARD_ATTR);
-      if (existingId && existingId !== productId) continue;
+      const existingKey = card.getAttribute(CARD_ATTR);
+      if (existingKey && existingKey !== identity.key) continue;
 
-      mountedIds.add(productId);
-      card.setAttribute(CARD_ATTR, productId);
-      buildCardControls(card, productId);
+      mountedCards.add(card);
+      visibleKeys.add(identity.key);
+      card.setAttribute(CARD_ATTR, identity.key);
+      mountCheckbox(card, identity);
     }
 
-    renderToolbar(visibleIds);
+    return visibleKeys;
   }
 
-  function renderToolbar(visibleIds) {
+  function renderToolbar(visibleKeys) {
     if (isProductPage()) {
       state.toolbar?.remove();
       state.toolbar = null;
@@ -359,7 +395,7 @@
       document.body.appendChild(state.toolbar);
     }
 
-    const ids = visibleIds || new Set(
+    const keys = visibleKeys || new Set(
       [...document.querySelectorAll(`[${CARD_ATTR}]`)]
         .map((el) => el.getAttribute(CARD_ATTR))
         .filter(Boolean)
@@ -370,8 +406,8 @@
     let viewed = 0;
     let fresh = 0;
 
-    for (const id of ids) {
-      const record = getRecord(id);
+    for (const key of keys) {
+      const record = getRecord(key);
       if (record?.status === 'parsed') parsed += 1;
       else if (record?.status === 'flagged') flagged += 1;
       else if (record?.lastOpenedAt) viewed += 1;
@@ -380,27 +416,54 @@
 
     state.toolbar.innerHTML = `
       <strong>Ali Parser</strong>
-      <span>${ids.size} prodotti</span>
-      <span class="ap-tb-parsed">✓ ${parsed}</span>
-      <span class="ap-tb-flagged">⚑ ${flagged}</span>
-      <span>● ${viewed}</span>
-      <span>○ ${fresh}</span>
+      <span>${keys.size} schede</span>
+      <span class="ap-tb-parsed">✓ ${parsed} parsate</span>
+      <span class="ap-tb-flagged">✓ ${flagged} flag</span>
+      <span>● ${viewed} viste</span>
+      <span>□ ${fresh} nuove</span>
     `;
   }
 
-  function markCurrentProductOpened(productId) {
-    const current = getRecord(productId) || {};
-    patchRecord(productId, {
+  function currentIdentity() {
+    const productId = currentProductId();
+    if (productId) {
+      return {
+        key: productId,
+        productId,
+        href: location.href,
+        fallback: false,
+      };
+    }
+
+    if (/\/item\//i.test(location.pathname)) {
+      const href = normalizeHref(location.href);
+      return {
+        key: `url:${hashString(href)}`,
+        productId: null,
+        href,
+        fallback: true,
+      };
+    }
+
+    return null;
+  }
+
+  function markCurrentOpened(identity) {
+    if (!identity) return;
+    const current = getRecord(identity.key) || {};
+    patchRecord(identity.key, {
+      productId: identity.productId,
       status: current.status || null,
       lastOpenedAt: Date.now(),
-      url: location.href,
+      href: location.href,
       title: document.querySelector('h1')?.textContent?.trim() || current.title || '',
+      identityFallback: identity.fallback,
     });
   }
 
   function renderProductPanel() {
-    const productId = currentProductId();
-    if (!productId) {
+    const identity = currentIdentity();
+    if (!identity) {
       state.panel?.remove();
       state.panel = null;
       return;
@@ -413,57 +476,64 @@
       document.body.appendChild(state.panel);
     }
 
-    const record = getRecord(productId);
-    const label = recordLabel(record);
-    const parsedDate = record?.parsedAt ? new Date(record.parsedAt).toLocaleString('it-IT') : '';
+    const record = getRecord(identity.key);
+    const info = statusInfo(record);
 
     state.panel.innerHTML = `
       <div class="ap-panel-title">Ali Parser</div>
-      <div class="ap-panel-id">ID ${productId}</div>
-      <div class="ap-panel-state ${label.cls}">${label.symbol} ${label.text}</div>
-      ${parsedDate ? `<div class="ap-panel-date">${escapeHtml(parsedDate)}</div>` : ''}
-      <div class="ap-panel-actions">
-        <button type="button" data-action="parsed">✓ Parsato</button>
-        <button type="button" data-action="flag">⚑ Flag</button>
-        <button type="button" data-action="reset">↺</button>
-      </div>
+      <div class="ap-panel-status ${info.cls}">${escapeHtml(info.label)}</div>
+      <label class="ap-panel-check-row">
+        <input type="checkbox" data-action="flag" ${record?.status === 'flagged' || record?.status === 'parsed' ? 'checked' : ''}>
+        <span>Gia gestito</span>
+      </label>
+      <button type="button" class="ap-panel-parsed" data-action="parsed">✓ Segna come parsato</button>
+      <button type="button" class="ap-panel-reset" data-action="reset">Azzera stato</button>
     `;
 
-    state.panel.querySelector('[data-action="parsed"]').addEventListener('click', () => {
-      patchRecord(productId, {
-        status: 'parsed',
-        parsedAt: Date.now(),
-        parsedManually: true,
-        flaggedAt: null,
-        url: location.href,
-        title: document.querySelector('h1')?.textContent?.trim() || '',
-      });
+    state.panel.querySelector('[data-action="flag"]').addEventListener('change', () => {
+      toggleManualFlag(identity);
     });
 
-    state.panel.querySelector('[data-action="flag"]').addEventListener('click', () => {
-      const recordNow = getRecord(productId);
-      if (recordNow?.status === 'flagged') {
-        deleteRecord(productId);
-        return;
-      }
-
-      patchRecord(productId, {
-        status: 'flagged',
-        flaggedAt: Date.now(),
-        parsedAt: null,
-        parsedManually: false,
-        url: location.href,
+    state.panel.querySelector('[data-action="parsed"]').addEventListener('click', () => {
+      patchRecord(identity.key, {
+        productId: identity.productId,
+        status: 'parsed',
+        parsedAt: Date.now(),
+        flaggedAt: null,
+        href: location.href,
         title: document.querySelector('h1')?.textContent?.trim() || '',
+        identityFallback: identity.fallback,
       });
     });
 
     state.panel.querySelector('[data-action="reset"]').addEventListener('click', () => {
-      if (confirm(`Azzerare lo stato del prodotto ${productId}?`)) deleteRecord(productId);
+      deleteRecord(identity.key);
     });
   }
 
+  function installNavigationGuard() {
+    document.addEventListener('click', (event) => {
+      if (event.target.closest(`[${UI_ATTR}]`)) return;
+      const anchor = event.target.closest('a[href]');
+      if (!anchor) return;
+
+      const identity = productIdentityFromAnchor(anchor);
+      if (!identity) return;
+
+      const record = getRecord(identity.key);
+      if (!record || !['parsed', 'flagged'].includes(record.status)) return;
+
+      const label = record.status === 'parsed' ? 'GIA PARSATO' : 'GIA FLAGGATO';
+      const proceed = confirm(`${label}\n\nVuoi aprire comunque questo articolo?`);
+      if (!proceed) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    }, true);
+  }
+
   function escapeHtml(value) {
-    return String(value)
+    return String(value || '')
       .replaceAll('&', '&amp;')
       .replaceAll('<', '&lt;')
       .replaceAll('>', '&gt;')
@@ -472,8 +542,8 @@
   }
 
   function refreshUi() {
-    document.querySelectorAll(`[${CARD_ATTR}]`).forEach((card) => {
-      updateCardControls(card, card.getAttribute(CARD_ATTR));
+    document.querySelectorAll(`[${UI_ATTR}="card-check"]`).forEach((control) => {
+      if (control.dataset.key) updateCheckbox(control, control.dataset.key);
     });
     renderToolbar();
     renderProductPanel();
@@ -481,37 +551,18 @@
 
   function handlePage() {
     if (isProductPage()) {
-      const productId = currentProductId();
-      if (productId) markCurrentProductOpened(productId);
+      state.toolbar?.remove();
+      state.toolbar = null;
+      const identity = currentIdentity();
+      markCurrentOpened(identity);
       renderProductPanel();
       return;
     }
 
     state.panel?.remove();
     state.panel = null;
-    scanProductCards();
-  }
-
-  function installGlobalNavigationGuard() {
-    document.addEventListener('click', (event) => {
-      if (event.target.closest(`[${UI_ATTR}]`)) return;
-
-      const anchor = event.target.closest('a[href]');
-      if (!anchor) return;
-
-      const productId = getElementProductId(anchor);
-      if (!productId) return;
-
-      const record = getRecord(productId);
-      if (!record || !['parsed', 'flagged'].includes(record.status)) return;
-
-      const kind = record.status === 'parsed' ? 'GIA PARSATO' : 'FLAGGATO MANUALMENTE';
-      const proceed = confirm(`${kind}\n\nProdotto ${productId}\n\nVuoi aprirlo comunque?`);
-      if (!proceed) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-      }
-    }, true);
+    const visibleKeys = collectCards();
+    renderToolbar(visibleKeys);
   }
 
   function exportRegistry() {
@@ -539,38 +590,34 @@
     const style = document.createElement('style');
     style.setAttribute(UI_ATTR, 'styles');
     style.textContent = `
-      .ap-card-controls {
+      .ap-card-check {
         position: absolute !important;
-        top: 7px !important;
-        right: 7px !important;
+        top: 8px !important;
+        right: 8px !important;
         z-index: 2147483000 !important;
-        display: flex !important;
-        gap: 5px !important;
-        align-items: center !important;
-        pointer-events: auto !important;
-        font-family: Arial, sans-serif !important;
-      }
-      .ap-card-controls button {
-        box-sizing: border-box !important;
-        width: 30px !important;
-        min-width: 30px !important;
-        height: 30px !important;
+        width: 34px !important;
+        height: 34px !important;
+        min-width: 34px !important;
         padding: 0 !important;
-        border: 1px solid rgba(0,0,0,.18) !important;
-        border-radius: 50% !important;
-        box-shadow: 0 2px 8px rgba(0,0,0,.24) !important;
+        border: 2px solid #111 !important;
+        border-radius: 7px !important;
+        background: rgba(255,255,255,.96) !important;
+        box-shadow: 0 2px 10px rgba(0,0,0,.28) !important;
+        color: #fff !important;
         cursor: pointer !important;
-        font: 800 15px/28px Arial, sans-serif !important;
-        text-align: center !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        pointer-events: auto !important;
+        font: 900 23px/1 Arial, sans-serif !important;
       }
-      .ap-status.ap-parsed { background: #167d3f !important; color: #fff !important; }
-      .ap-status.ap-flagged { background: #b76b00 !important; color: #fff !important; }
-      .ap-status.ap-viewed { background: #1f66b2 !important; color: #fff !important; }
-      .ap-status.ap-new { background: rgba(255,255,255,.97) !important; color: #333 !important; }
-      .ap-flag { background: rgba(255,255,255,.97) !important; color: #555 !important; }
-      .ap-flag.is-active { background: #b76b00 !important; color: #fff !important; }
-      .ap-card-done { opacity: .58 !important; }
-      .ap-card-done:hover { opacity: 1 !important; }
+      .ap-card-check:hover { transform: scale(1.08) !important; }
+      .ap-card-check.ap-flagged { background: #d47a00 !important; border-color: #9e5900 !important; }
+      .ap-card-check.ap-parsed { background: #16813f !important; border-color: #0d5f2c !important; }
+      .ap-card-check.ap-viewed { background: rgba(255,255,255,.96) !important; border-color: #2769ad !important; }
+      .ap-card-check.ap-new { background: rgba(255,255,255,.96) !important; border-color: #111 !important; }
+      .ap-checkmark { display: block !important; color: #fff !important; }
+
       .ap-toolbar {
         position: fixed !important;
         left: 14px !important;
@@ -589,49 +636,63 @@
       .ap-toolbar strong { font-size: 13px !important; }
       .ap-tb-parsed { color: #7ee2a2 !important; }
       .ap-tb-flagged { color: #ffca78 !important; }
+
       .ap-product-panel {
         position: fixed !important;
-        right: 16px !important;
-        bottom: 16px !important;
+        top: 86px !important;
+        right: 18px !important;
         z-index: 2147483646 !important;
         width: 230px !important;
         box-sizing: border-box !important;
-        padding: 12px !important;
+        padding: 13px !important;
+        border: 2px solid #111 !important;
         border-radius: 12px !important;
-        background: rgba(22,22,22,.96) !important;
-        color: #fff !important;
-        box-shadow: 0 6px 24px rgba(0,0,0,.35) !important;
-        font: 12px/1.3 Arial, sans-serif !important;
-      }
-      .ap-panel-title { font-size: 14px !important; font-weight: 800 !important; margin-bottom: 2px !important; }
-      .ap-panel-id { opacity: .7 !important; font-size: 11px !important; margin-bottom: 8px !important; word-break: break-all !important; }
-      .ap-panel-state { display: inline-block !important; border-radius: 999px !important; padding: 5px 9px !important; font-weight: 800 !important; margin-bottom: 5px !important; }
-      .ap-panel-state.ap-parsed { background: #167d3f !important; }
-      .ap-panel-state.ap-flagged { background: #b76b00 !important; }
-      .ap-panel-state.ap-viewed { background: #1f66b2 !important; }
-      .ap-panel-state.ap-new { background: #555 !important; }
-      .ap-panel-date { opacity: .72 !important; margin: 2px 0 8px !important; }
-      .ap-panel-actions { display: flex !important; gap: 6px !important; margin-top: 8px !important; }
-      .ap-panel-actions button {
-        flex: 1 !important;
-        border: 0 !important;
-        border-radius: 7px !important;
-        padding: 7px 6px !important;
         background: #fff !important;
-        color: #222 !important;
+        color: #111 !important;
+        box-shadow: 0 7px 28px rgba(0,0,0,.32) !important;
+        font: 13px/1.3 Arial, sans-serif !important;
+      }
+      .ap-panel-title { font-size: 15px !important; font-weight: 800 !important; margin-bottom: 8px !important; }
+      .ap-panel-status { display: inline-block !important; margin-bottom: 10px !important; padding: 4px 8px !important; border-radius: 999px !important; font-weight: 800 !important; background: #eee !important; }
+      .ap-panel-status.ap-parsed { background: #d9f5e3 !important; color: #0d5f2c !important; }
+      .ap-panel-status.ap-flagged { background: #fff0d7 !important; color: #8a4b00 !important; }
+      .ap-panel-status.ap-viewed { background: #e0efff !important; color: #1c568f !important; }
+      .ap-panel-check-row {
+        display: flex !important;
+        align-items: center !important;
+        gap: 9px !important;
+        margin: 3px 0 10px !important;
         cursor: pointer !important;
-        font-size: 11px !important;
         font-weight: 700 !important;
       }
-      .ap-panel-actions button:last-child { flex: 0 0 32px !important; }
+      .ap-panel-check-row input {
+        width: 22px !important;
+        height: 22px !important;
+        accent-color: #d47a00 !important;
+        cursor: pointer !important;
+      }
+      .ap-product-panel button {
+        width: 100% !important;
+        box-sizing: border-box !important;
+        margin-top: 6px !important;
+        padding: 8px 10px !important;
+        border-radius: 7px !important;
+        cursor: pointer !important;
+        font: 700 12px/1.2 Arial, sans-serif !important;
+      }
+      .ap-panel-parsed { border: 0 !important; background: #16813f !important; color: #fff !important; }
+      .ap-panel-reset { border: 1px solid #bbb !important; background: #fff !important; color: #444 !important; }
     `;
     document.head.appendChild(style);
   }
 
-  function scheduleScan(delay = 350) {
+  function scheduleScan(delay = 300) {
     clearTimeout(state.scanTimer);
     state.scanTimer = setTimeout(() => {
-      if (!isProductPage()) scanProductCards();
+      if (!isProductPage()) {
+        const visibleKeys = collectCards();
+        renderToolbar(visibleKeys);
+      }
     }, delay);
   }
 
@@ -645,8 +706,8 @@
     setInterval(() => {
       if (state.currentUrl === location.href) return;
       state.currentUrl = location.href;
-      setTimeout(handlePage, 300);
-    }, 700);
+      setTimeout(handlePage, 250);
+    }, 600);
   }
 
   GM_addValueChangeListener(STORE_KEY, () => refreshUi());
@@ -654,10 +715,10 @@
   GM_registerMenuCommand('Ali Parser: azzera tutti gli stati', resetRegistry);
 
   installStyles();
-  installGlobalNavigationGuard();
+  installNavigationGuard();
   startObserver();
   watchUrlChanges();
   handlePage();
-  setTimeout(handlePage, 1200);
-  setTimeout(handlePage, 3000);
+  setTimeout(handlePage, 1000);
+  setTimeout(handlePage, 2500);
 })();
