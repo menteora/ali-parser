@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ali Parser - Parsing Tracker
 // @namespace    https://github.com/menteora/ali-parser
-// @version      0.7.0
+// @version      0.7.1
 // @description  Salva stato e note dei prodotti AliExpress, mostra le note nelle preview e offre un registro visuale consultabile e copiabile.
 // @author       menteora
 // @updateURL    https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
@@ -933,15 +933,10 @@
       return;
     }
 
-    const firstConfirm = confirm(
-      `Stai per cancellare definitivamente ${total} prodotti dal database locale di Ali Parser, incluse note e stati.\n\nVuoi continuare?`
+    const confirmed = confirm(
+      `Stai per cancellare definitivamente ${total} prodotti dal database locale di Ali Parser, incluse note e stati. Questa operazione non puo essere annullata.\n\nVuoi continuare?`
     );
-    if (!firstConfirm) return;
-
-    const finalConfirm = confirm(
-      'Conferma definitiva: azzerare tutto il database di Ali Parser? Questa operazione non puo essere annullata.'
-    );
-    if (!finalConfirm) return;
+    if (!confirmed) return;
 
     GM_deleteValue(STORE_KEY);
     refreshUi();
