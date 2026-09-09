@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ali Parser - Parsing Tracker
 // @namespace    https://github.com/menteora/ali-parser
-// @version      0.6.0
-// @description  Salva stato e note dei prodotti AliExpress, mostra le note nelle preview e offre un registro visuale consultabile.
+// @version      0.7.0
+// @description  Salva stato e note dei prodotti AliExpress, mostra le note nelle preview e offre un registro visuale consultabile e copiabile.
 // @author       menteora
 // @updateURL    https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
 // @downloadURL  https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
@@ -13,6 +13,7 @@
 // @grant        GM_deleteValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -652,6 +653,28 @@
     return true;
   }
 
+  function filteredRegistryRecords() {
+    const allRecords = registryRecords();
+    const query = state.registryQuery.trim().toLowerCase();
+    const filtered = allRecords.filter((record) => {
+      if (!matchesRegistryFilter(record, state.registryFilter)) return false;
+      if (!query) return true;
+
+      const haystack = [
+        record.title,
+        record.note,
+        record.href,
+        record.productId,
+        record.key,
+        statusInfo(record).label,
+      ].filter(Boolean).join(' ').toLowerCase();
+
+      return haystack.includes(query);
+    });
+
+    return { allRecords, filtered };
+  }
+
   function formatDate(timestamp) {
     if (!timestamp) return '';
     try {
@@ -690,30 +713,62 @@
     `;
   }
 
+  function registryCopyText(records) {
+    return records.map((record, index) => {
+      const info = statusInfo(record);
+      const href = safeProductHref(record);
+      const title = String(record.title || '').trim() || (record.productId ? `Prodotto ${record.productId}` : record.key || 'Prodotto');
+      const note = String(record.note || '').trim();
+
+      return [
+        `${index + 1}. ${title}`,
+        `Stato: ${info.label}`,
+        href ? `Link: ${href}` : '',
+        note ? `Nota: ${note}` : '',
+      ].filter(Boolean).join('\n');
+    }).join('\n\n');
+  }
+
+  function copyRegistryView() {
+    if (!state.registryModal) return;
+
+    const { filtered } = filteredRegistryRecords();
+    const button = state.registryModal.querySelector('[data-action="registry-copy"]');
+    if (!filtered.length) {
+      if (button) {
+        const previous = button.textContent;
+        button.textContent = 'Niente da copiare';
+        setTimeout(() => {
+          if (button.isConnected) button.textContent = previous;
+        }, 1400);
+      }
+      return;
+    }
+
+    const text = registryCopyText(filtered);
+    GM_setClipboard(text, 'text');
+
+    if (button) {
+      const previous = button.textContent;
+      button.textContent = `Copiati ${filtered.length}`;
+      setTimeout(() => {
+        if (button.isConnected) button.textContent = previous;
+      }, 1400);
+    }
+  }
+
   function renderRegistryList() {
     if (!state.registryModal) return;
 
-    const allRecords = registryRecords();
-    const query = state.registryQuery.trim().toLowerCase();
-    const filtered = allRecords.filter((record) => {
-      if (!matchesRegistryFilter(record, state.registryFilter)) return false;
-      if (!query) return true;
-
-      const haystack = [
-        record.title,
-        record.note,
-        record.href,
-        record.productId,
-        record.key,
-        statusInfo(record).label,
-      ].filter(Boolean).join(' ').toLowerCase();
-
-      return haystack.includes(query);
-    });
-
+    const { allRecords, filtered } = filteredRegistryRecords();
     const count = state.registryModal.querySelector('[data-role="registry-count"]');
+    const total = state.registryModal.querySelector('[data-role="registry-total"]');
     const list = state.registryModal.querySelector('[data-role="registry-list"]');
-    if (count) count.textContent = `${filtered.length} di ${allRecords.length} prodotti`;
+
+    if (total) total.textContent = `${allRecords.length} salvati`;
+    if (count) count.textContent = filtered.length === allRecords.length
+      ? `${allRecords.length} prodotti nel registro`
+      : `${filtered.length} visualizzati su ${allRecords.length}`;
     if (!list) return;
 
     list.innerHTML = filtered.length
@@ -735,7 +790,10 @@
       <section class="ap-registry-modal" role="dialog" aria-modal="true" aria-label="Registro Ali Parser">
         <header class="ap-registry-head">
           <div>
-            <div class="ap-registry-heading">Registro Ali Parser</div>
+            <div class="ap-registry-title-line">
+              <div class="ap-registry-heading">Registro Ali Parser</div>
+              <span class="ap-registry-total" data-role="registry-total">0 salvati</span>
+            </div>
             <div class="ap-registry-subtitle">Link e note salvati, senza esportazione.</div>
           </div>
           <button type="button" class="ap-registry-close" data-action="registry-close" aria-label="Chiudi">×</button>
@@ -749,6 +807,7 @@
             <option value="flagged">Flag</option>
             <option value="viewed">Visti</option>
           </select>
+          <button type="button" class="ap-registry-copy" data-action="registry-copy">Copia lista</button>
         </div>
         <div class="ap-registry-count" data-role="registry-count"></div>
         <div class="ap-registry-list" data-role="registry-list"></div>
@@ -772,6 +831,7 @@
       renderRegistryList();
     });
 
+    modal.querySelector('[data-action="registry-copy"]').addEventListener('click', copyRegistryView);
     modal.querySelector('[data-action="registry-close"]').addEventListener('click', closeRegistryModal);
     modal.addEventListener('click', (event) => {
       if (event.target === modal) closeRegistryModal();
@@ -867,7 +927,22 @@
   }
 
   function resetRegistry() {
-    if (!confirm('Cancellare TUTTI gli stati e TUTTE le note salvate da Ali Parser?')) return;
+    const total = registryRecords().length;
+    if (!total) {
+      alert('Il registro Ali Parser e gia vuoto.');
+      return;
+    }
+
+    const firstConfirm = confirm(
+      `Stai per cancellare definitivamente ${total} prodotti dal database locale di Ali Parser, incluse note e stati.\n\nVuoi continuare?`
+    );
+    if (!firstConfirm) return;
+
+    const finalConfirm = confirm(
+      'Conferma definitiva: azzerare tutto il database di Ali Parser? Questa operazione non puo essere annullata.'
+    );
+    if (!finalConfirm) return;
+
     GM_deleteValue(STORE_KEY);
     refreshUi();
   }
@@ -1067,7 +1142,19 @@
         padding: 18px 20px 12px !important;
         border-bottom: 1px solid #e2e2e2 !important;
       }
+      .ap-registry-title-line { display: flex !important; align-items: center !important; gap: 9px !important; flex-wrap: wrap !important; }
       .ap-registry-heading { font-size: 20px !important; line-height: 1.2 !important; font-weight: 900 !important; }
+      .ap-registry-total {
+        display: inline-block !important;
+        padding: 3px 7px !important;
+        border: 1px solid #ddd !important;
+        border-radius: 999px !important;
+        background: #f7f7f7 !important;
+        color: #777 !important;
+        font-size: 10px !important;
+        font-weight: 700 !important;
+        white-space: nowrap !important;
+      }
       .ap-registry-subtitle { margin-top: 3px !important; color: #666 !important; font-size: 12px !important; }
       .ap-registry-close {
         width: 36px !important;
@@ -1081,7 +1168,7 @@
       }
       .ap-registry-controls {
         display: grid !important;
-        grid-template-columns: 1fr 150px !important;
+        grid-template-columns: minmax(0, 1fr) 150px auto !important;
         gap: 10px !important;
         padding: 12px 20px 8px !important;
       }
@@ -1096,7 +1183,17 @@
         color: #111 !important;
         font: 13px/1.2 Arial, sans-serif !important;
       }
-      .ap-registry-count { padding: 0 20px 9px !important; color: #666 !important; font-size: 11px !important; }
+      .ap-registry-copy {
+        padding: 10px 13px !important;
+        border: 1px solid #222 !important;
+        border-radius: 8px !important;
+        background: #222 !important;
+        color: #fff !important;
+        cursor: pointer !important;
+        font: 800 12px/1.2 Arial, sans-serif !important;
+        white-space: nowrap !important;
+      }
+      .ap-registry-count { padding: 0 20px 9px !important; color: #777 !important; font-size: 10px !important; }
       .ap-registry-list { overflow: auto !important; padding: 0 20px 20px !important; }
       .ap-registry-row {
         display: grid !important;
