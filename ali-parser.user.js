@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ali Parser - Parsing Tracker
 // @namespace    https://github.com/menteora/ali-parser
-// @version      0.5.0
-// @description  Salva stato e note dei prodotti AliExpress e li mostra anche nelle schede e nei suggerimenti.
+// @version      0.6.0
+// @description  Salva stato e note dei prodotti AliExpress, mostra le note nelle preview e offre un registro visuale consultabile.
 // @author       menteora
 // @updateURL    https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
 // @downloadURL  https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
@@ -29,6 +29,9 @@
     scanTimer: null,
     toolbar: null,
     panel: null,
+    registryModal: null,
+    registryQuery: '',
+    registryFilter: 'all',
   };
 
   function loadRegistry() {
@@ -283,7 +286,7 @@
   function statusInfo(record) {
     if (!record) return { label: 'Nuovo', cls: 'ap-new' };
     if (record.status === 'parsed') return { label: 'Parsato', cls: 'ap-parsed' };
-    if (record.status === 'flagged') return { label: 'Flag manuale', cls: 'ap-flagged' };
+    if (record.status === 'flagged') return { label: 'Flag', cls: 'ap-flagged' };
     if (record.lastOpenedAt) return { label: 'Visto', cls: 'ap-viewed' };
     return { label: 'Nuovo', cls: 'ap-new' };
   }
@@ -405,6 +408,11 @@
     note.setAttribute('aria-label', text ? `Nota prodotto: ${text}` : '');
   }
 
+  function resetRecycledCard(card) {
+    card.querySelectorAll(`:scope > [${UI_ATTR}="card-check"], :scope > [${UI_ATTR}="card-note"]`).forEach((node) => node.remove());
+    card.removeAttribute(CARD_ATTR);
+  }
+
   function collectCards() {
     const visibleKeys = new Set();
     const mountedCards = new WeakSet();
@@ -418,8 +426,8 @@
       const identity = productIdentityFromAnchor(anchor);
       if (!identity) continue;
 
-      // Nella pagina prodotto non applicare il badge al prodotto principale.
-      // Gli altri link prodotto sono suggerimenti, correlati, sponsorizzati, ecc.
+      // Nella pagina prodotto il prodotto principale usa il pannello laterale.
+      // Tutti gli altri link prodotto (correlati, suggeriti, sponsorizzati) ricevono stato e nota.
       if (currentKey && identity.key === currentKey) continue;
 
       const card = findCard(anchor);
@@ -427,7 +435,10 @@
       if (mountedCards.has(card)) continue;
 
       const existingKey = card.getAttribute(CARD_ATTR);
-      if (existingKey && existingKey !== identity.key) continue;
+      if (existingKey && existingKey !== identity.key) {
+        // AliExpress riutilizza spesso la stessa card per un prodotto diverso nei caroselli SPA.
+        resetRecycledCard(card);
+      }
 
       mountedCards.add(card);
       visibleKeys.add(identity.key);
@@ -478,12 +489,15 @@
     state.toolbar.innerHTML = `
       <strong>Ali Parser</strong>
       <span>${keys.size} schede</span>
-      <span class="ap-tb-parsed">✓ ${parsed} parsate</span>
-      <span class="ap-tb-flagged">✓ ${flagged} flag</span>
-      <span>● ${viewed} viste</span>
-      <span>□ ${fresh} nuove</span>
+      <span class="ap-tb-parsed">✓ ${parsed}</span>
+      <span class="ap-tb-flagged">Flag ${flagged}</span>
+      <span>Visti ${viewed}</span>
+      <span>Nuovi ${fresh}</span>
       <span class="ap-tb-noted">Note ${noted}</span>
+      <button type="button" class="ap-toolbar-registry" data-action="open-registry">Registro</button>
     `;
+
+    state.toolbar.querySelector('[data-action="open-registry"]')?.addEventListener('click', openRegistryModal);
   }
 
   function currentIdentity() {
@@ -542,7 +556,10 @@
     const info = statusInfo(record);
 
     state.panel.innerHTML = `
-      <div class="ap-panel-title">Ali Parser</div>
+      <div class="ap-panel-head">
+        <div class="ap-panel-title">Ali Parser</div>
+        <button type="button" class="ap-panel-registry" data-action="open-registry">Registro</button>
+      </div>
       <div class="ap-panel-status ${info.cls}">${escapeHtml(info.label)}</div>
       <label class="ap-panel-check-row">
         <input type="checkbox" data-action="flag" ${record?.status === 'flagged' || record?.status === 'parsed' ? 'checked' : ''}>
@@ -553,9 +570,11 @@
       <div class="ap-panel-note-separator"></div>
       <label class="ap-panel-note-label" for="ap-product-note">Nota prodotto</label>
       <textarea id="ap-product-note" class="ap-panel-note" data-action="note" placeholder="Es. buon margine, packaging debole, da confrontare...">${escapeHtml(record?.note || '')}</textarea>
-      <div class="ap-panel-note-help">La nota viene mostrata anche sulle schede prodotto.</div>
+      <div class="ap-panel-note-help">Visibile anche nelle preview di questo prodotto.</div>
       <button type="button" class="ap-panel-note-save" data-action="save-note">Salva nota</button>
     `;
+
+    state.panel.querySelector('[data-action="open-registry"]')?.addEventListener('click', openRegistryModal);
 
     state.panel.querySelector('[data-action="flag"]').addEventListener('change', () => {
       toggleManualFlag(identity);
@@ -598,6 +617,175 @@
     });
   }
 
+  function safeProductHref(record) {
+    const candidates = [record?.href];
+    if (record?.productId) {
+      candidates.push(`https://www.aliexpress.com/item/${record.productId}.html`);
+    }
+
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      try {
+        const url = new URL(candidate, location.href);
+        if (!/^https?:$/.test(url.protocol)) continue;
+        if (!/(^|\.)aliexpress\.com$/i.test(url.hostname)) continue;
+        return url.toString();
+      } catch (_) {
+        // Prova il candidato successivo.
+      }
+    }
+
+    return '';
+  }
+
+  function registryRecords() {
+    return Object.values(loadRegistry())
+      .filter((record) => record && typeof record === 'object')
+      .sort((a, b) => (b.updatedAt || b.lastOpenedAt || 0) - (a.updatedAt || a.lastOpenedAt || 0));
+  }
+
+  function matchesRegistryFilter(record, filter) {
+    if (filter === 'noted') return Boolean(String(record.note || '').trim());
+    if (filter === 'parsed') return record.status === 'parsed';
+    if (filter === 'flagged') return record.status === 'flagged';
+    if (filter === 'viewed') return Boolean(record.lastOpenedAt) && !record.status;
+    return true;
+  }
+
+  function formatDate(timestamp) {
+    if (!timestamp) return '';
+    try {
+      return new Intl.DateTimeFormat('it-IT', {
+        day: '2-digit',
+        month: '2-digit',
+        year: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      }).format(new Date(timestamp));
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function registryRowHtml(record) {
+    const info = statusInfo(record);
+    const href = safeProductHref(record);
+    const title = String(record.title || '').trim() || (record.productId ? `Prodotto ${record.productId}` : record.key || 'Prodotto');
+    const note = String(record.note || '').trim();
+    const updated = record.noteUpdatedAt || record.updatedAt || record.lastOpenedAt;
+
+    return `
+      <article class="ap-registry-row">
+        <div class="ap-registry-row-main">
+          <div class="ap-registry-row-top">
+            <span class="ap-registry-status ${info.cls}">${escapeHtml(info.label)}</span>
+            <strong class="ap-registry-title">${escapeHtml(title)}</strong>
+          </div>
+          ${href ? `<a class="ap-registry-url" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(href)}</a>` : '<span class="ap-registry-url ap-registry-url-missing">Link non disponibile</span>'}
+          <div class="ap-registry-note ${note ? '' : 'ap-registry-note-empty'}">${note ? escapeHtml(note) : 'Nessuna nota'}</div>
+          <div class="ap-registry-meta">${updated ? `Aggiornato ${escapeHtml(formatDate(updated))}` : ''}</div>
+        </div>
+        ${href ? `<a class="ap-registry-open" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">Apri</a>` : ''}
+      </article>
+    `;
+  }
+
+  function renderRegistryList() {
+    if (!state.registryModal) return;
+
+    const allRecords = registryRecords();
+    const query = state.registryQuery.trim().toLowerCase();
+    const filtered = allRecords.filter((record) => {
+      if (!matchesRegistryFilter(record, state.registryFilter)) return false;
+      if (!query) return true;
+
+      const haystack = [
+        record.title,
+        record.note,
+        record.href,
+        record.productId,
+        record.key,
+        statusInfo(record).label,
+      ].filter(Boolean).join(' ').toLowerCase();
+
+      return haystack.includes(query);
+    });
+
+    const count = state.registryModal.querySelector('[data-role="registry-count"]');
+    const list = state.registryModal.querySelector('[data-role="registry-list"]');
+    if (count) count.textContent = `${filtered.length} di ${allRecords.length} prodotti`;
+    if (!list) return;
+
+    list.innerHTML = filtered.length
+      ? filtered.map(registryRowHtml).join('')
+      : '<div class="ap-registry-empty">Nessun prodotto corrisponde alla ricerca.</div>';
+  }
+
+  function openRegistryModal() {
+    if (state.registryModal) {
+      state.registryModal.querySelector('[data-action="registry-search"]')?.focus();
+      renderRegistryList();
+      return;
+    }
+
+    const modal = document.createElement('div');
+    modal.setAttribute(UI_ATTR, 'registry-modal');
+    modal.className = 'ap-registry-overlay';
+    modal.innerHTML = `
+      <section class="ap-registry-modal" role="dialog" aria-modal="true" aria-label="Registro Ali Parser">
+        <header class="ap-registry-head">
+          <div>
+            <div class="ap-registry-heading">Registro Ali Parser</div>
+            <div class="ap-registry-subtitle">Link e note salvati, senza esportazione.</div>
+          </div>
+          <button type="button" class="ap-registry-close" data-action="registry-close" aria-label="Chiudi">×</button>
+        </header>
+        <div class="ap-registry-controls">
+          <input type="search" class="ap-registry-search" data-action="registry-search" placeholder="Cerca titolo, link, ID o nota..." value="${escapeHtml(state.registryQuery)}">
+          <select class="ap-registry-filter" data-action="registry-filter">
+            <option value="all">Tutti</option>
+            <option value="noted">Con nota</option>
+            <option value="parsed">Parsati</option>
+            <option value="flagged">Flag</option>
+            <option value="viewed">Visti</option>
+          </select>
+        </div>
+        <div class="ap-registry-count" data-role="registry-count"></div>
+        <div class="ap-registry-list" data-role="registry-list"></div>
+      </section>
+    `;
+
+    document.body.appendChild(modal);
+    state.registryModal = modal;
+
+    const search = modal.querySelector('[data-action="registry-search"]');
+    const filter = modal.querySelector('[data-action="registry-filter"]');
+    filter.value = state.registryFilter;
+
+    search.addEventListener('input', () => {
+      state.registryQuery = search.value;
+      renderRegistryList();
+    });
+
+    filter.addEventListener('change', () => {
+      state.registryFilter = filter.value;
+      renderRegistryList();
+    });
+
+    modal.querySelector('[data-action="registry-close"]').addEventListener('click', closeRegistryModal);
+    modal.addEventListener('click', (event) => {
+      if (event.target === modal) closeRegistryModal();
+    });
+
+    renderRegistryList();
+    search.focus();
+  }
+
+  function closeRegistryModal() {
+    state.registryModal?.remove();
+    state.registryModal = null;
+  }
+
   function installNavigationGuard() {
     document.addEventListener('click', (event) => {
       if (event.target.closest(`[${UI_ATTR}]`)) return;
@@ -619,6 +807,14 @@
     }, true);
   }
 
+  function installKeyboardShortcuts() {
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && state.registryModal) {
+        closeRegistryModal();
+      }
+    });
+  }
+
   function escapeHtml(value) {
     return String(value || '')
       .replaceAll('&', '&amp;')
@@ -637,6 +833,7 @@
     });
     renderToolbar();
     renderProductPanel();
+    renderRegistryList();
   }
 
   function handlePage() {
@@ -754,13 +951,23 @@
       .ap-tb-parsed { color: #7ee2a2 !important; }
       .ap-tb-flagged { color: #ffca78 !important; }
       .ap-tb-noted { color: #ffe89a !important; }
+      .ap-toolbar-registry {
+        margin-left: 3px !important;
+        padding: 6px 9px !important;
+        border: 1px solid #777 !important;
+        border-radius: 7px !important;
+        background: #fff !important;
+        color: #111 !important;
+        cursor: pointer !important;
+        font: 800 11px/1 Arial, sans-serif !important;
+      }
 
       .ap-product-panel {
         position: fixed !important;
         top: 86px !important;
         right: 18px !important;
         z-index: 2147483646 !important;
-        width: 260px !important;
+        width: 270px !important;
         box-sizing: border-box !important;
         padding: 13px !important;
         border: 2px solid #111 !important;
@@ -770,7 +977,8 @@
         box-shadow: 0 7px 28px rgba(0,0,0,.32) !important;
         font: 13px/1.3 Arial, sans-serif !important;
       }
-      .ap-panel-title { font-size: 15px !important; font-weight: 800 !important; margin-bottom: 8px !important; }
+      .ap-panel-head { display: flex !important; align-items: center !important; justify-content: space-between !important; gap: 8px !important; margin-bottom: 8px !important; }
+      .ap-panel-title { font-size: 15px !important; font-weight: 800 !important; }
       .ap-panel-status { display: inline-block !important; margin-bottom: 10px !important; padding: 4px 8px !important; border-radius: 999px !important; font-weight: 800 !important; background: #eee !important; }
       .ap-panel-status.ap-parsed { background: #d9f5e3 !important; color: #0d5f2c !important; }
       .ap-panel-status.ap-flagged { background: #fff0d7 !important; color: #8a4b00 !important; }
@@ -798,6 +1006,14 @@
         cursor: pointer !important;
         font: 700 12px/1.2 Arial, sans-serif !important;
       }
+      .ap-product-panel .ap-panel-registry {
+        width: auto !important;
+        margin: 0 !important;
+        padding: 5px 8px !important;
+        border: 1px solid #aaa !important;
+        background: #f5f5f5 !important;
+        color: #222 !important;
+      }
       .ap-panel-parsed { border: 0 !important; background: #16813f !important; color: #fff !important; }
       .ap-panel-reset { border: 1px solid #bbb !important; background: #fff !important; color: #444 !important; }
       .ap-panel-note-separator { height: 1px !important; margin: 13px 0 11px !important; background: #ddd !important; }
@@ -817,6 +1033,146 @@
       .ap-panel-note:focus { outline: 2px solid #d5a500 !important; outline-offset: 1px !important; }
       .ap-panel-note-help { margin-top: 5px !important; color: #666 !important; font-size: 10px !important; line-height: 1.3 !important; }
       .ap-panel-note-save { border: 1px solid #b68a00 !important; background: #fff0a6 !important; color: #382c00 !important; }
+
+      .ap-registry-overlay {
+        position: fixed !important;
+        inset: 0 !important;
+        z-index: 2147483647 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        padding: 22px !important;
+        box-sizing: border-box !important;
+        background: rgba(0,0,0,.58) !important;
+        font-family: Arial, sans-serif !important;
+      }
+      .ap-registry-modal {
+        width: min(980px, 96vw) !important;
+        max-height: 90vh !important;
+        display: flex !important;
+        flex-direction: column !important;
+        box-sizing: border-box !important;
+        overflow: hidden !important;
+        border: 1px solid #222 !important;
+        border-radius: 14px !important;
+        background: #fff !important;
+        color: #111 !important;
+        box-shadow: 0 20px 70px rgba(0,0,0,.4) !important;
+      }
+      .ap-registry-head {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: space-between !important;
+        gap: 16px !important;
+        padding: 18px 20px 12px !important;
+        border-bottom: 1px solid #e2e2e2 !important;
+      }
+      .ap-registry-heading { font-size: 20px !important; line-height: 1.2 !important; font-weight: 900 !important; }
+      .ap-registry-subtitle { margin-top: 3px !important; color: #666 !important; font-size: 12px !important; }
+      .ap-registry-close {
+        width: 36px !important;
+        height: 36px !important;
+        border: 0 !important;
+        border-radius: 8px !important;
+        background: #eee !important;
+        color: #111 !important;
+        cursor: pointer !important;
+        font: 700 25px/1 Arial, sans-serif !important;
+      }
+      .ap-registry-controls {
+        display: grid !important;
+        grid-template-columns: 1fr 150px !important;
+        gap: 10px !important;
+        padding: 12px 20px 8px !important;
+      }
+      .ap-registry-search,
+      .ap-registry-filter {
+        width: 100% !important;
+        box-sizing: border-box !important;
+        padding: 10px 11px !important;
+        border: 1px solid #aaa !important;
+        border-radius: 8px !important;
+        background: #fff !important;
+        color: #111 !important;
+        font: 13px/1.2 Arial, sans-serif !important;
+      }
+      .ap-registry-count { padding: 0 20px 9px !important; color: #666 !important; font-size: 11px !important; }
+      .ap-registry-list { overflow: auto !important; padding: 0 20px 20px !important; }
+      .ap-registry-row {
+        display: grid !important;
+        grid-template-columns: minmax(0, 1fr) auto !important;
+        gap: 14px !important;
+        align-items: start !important;
+        padding: 14px 0 !important;
+        border-top: 1px solid #eee !important;
+      }
+      .ap-registry-row:first-child { border-top: 0 !important; }
+      .ap-registry-row-main { min-width: 0 !important; }
+      .ap-registry-row-top { display: flex !important; gap: 8px !important; align-items: center !important; min-width: 0 !important; }
+      .ap-registry-status {
+        flex: 0 0 auto !important;
+        padding: 3px 7px !important;
+        border-radius: 999px !important;
+        background: #eee !important;
+        font-size: 10px !important;
+        font-weight: 900 !important;
+        text-transform: uppercase !important;
+      }
+      .ap-registry-status.ap-parsed { background: #d9f5e3 !important; color: #0d5f2c !important; }
+      .ap-registry-status.ap-flagged { background: #fff0d7 !important; color: #8a4b00 !important; }
+      .ap-registry-status.ap-viewed { background: #e0efff !important; color: #1c568f !important; }
+      .ap-registry-title {
+        min-width: 0 !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+        font-size: 13px !important;
+      }
+      .ap-registry-url {
+        display: block !important;
+        margin-top: 6px !important;
+        overflow: hidden !important;
+        color: #245a9a !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+        text-decoration: none !important;
+        font: 11px/1.25 ui-monospace, SFMono-Regular, Consolas, monospace !important;
+      }
+      .ap-registry-url:hover { text-decoration: underline !important; }
+      .ap-registry-url-missing { color: #999 !important; }
+      .ap-registry-note {
+        margin-top: 8px !important;
+        padding: 8px 10px !important;
+        border: 1px solid #dec45a !important;
+        border-radius: 7px !important;
+        background: #fff9d9 !important;
+        color: #332900 !important;
+        white-space: pre-wrap !important;
+        overflow-wrap: anywhere !important;
+        font-size: 12px !important;
+        line-height: 1.35 !important;
+      }
+      .ap-registry-note-empty { border-color: #e5e5e5 !important; background: #fafafa !important; color: #999 !important; font-style: italic !important; }
+      .ap-registry-meta { margin-top: 5px !important; color: #999 !important; font-size: 10px !important; }
+      .ap-registry-open {
+        align-self: center !important;
+        padding: 8px 11px !important;
+        border-radius: 7px !important;
+        background: #111 !important;
+        color: #fff !important;
+        text-decoration: none !important;
+        font-size: 11px !important;
+        font-weight: 800 !important;
+      }
+      .ap-registry-empty { padding: 30px 0 !important; color: #777 !important; text-align: center !important; font-size: 13px !important; }
+
+      @media (max-width: 720px) {
+        .ap-registry-overlay { padding: 8px !important; }
+        .ap-registry-modal { width: 100% !important; max-height: 94vh !important; }
+        .ap-registry-controls { grid-template-columns: 1fr !important; }
+        .ap-registry-row { grid-template-columns: 1fr !important; }
+        .ap-registry-open { justify-self: start !important; }
+      }
     `;
     document.head.appendChild(style);
   }
@@ -846,11 +1202,13 @@
   }
 
   GM_addValueChangeListener(STORE_KEY, () => refreshUi());
+  GM_registerMenuCommand('Ali Parser: apri registro', openRegistryModal);
   GM_registerMenuCommand('Ali Parser: esporta registro JSON', exportRegistry);
   GM_registerMenuCommand('Ali Parser: cancella registro (stati + note)', resetRegistry);
 
   installStyles();
   installNavigationGuard();
+  installKeyboardShortcuts();
   startObserver();
   watchUrlChanges();
   handlePage();
