@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ali Parser - Parsing Tracker
 // @namespace    https://github.com/menteora/ali-parser
-// @version      0.4.0
-// @description  Mostra e salva lo stato degli articoli AliExpress anche nei suggerimenti dentro le pagine prodotto.
+// @version      0.5.0
+// @description  Salva stato e note dei prodotti AliExpress e li mostra anche nelle schede e nei suggerimenti.
 // @author       menteora
 // @updateURL    https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
 // @downloadURL  https://raw.githubusercontent.com/menteora/ali-parser/main/ali-parser.user.js
@@ -63,6 +63,18 @@
     delete registry[key];
     saveRegistry(registry);
     refreshUi();
+  }
+
+  function clearProductState(key, { clearOpened = false } = {}) {
+    const record = getRecord(key);
+    if (!record) return;
+
+    patchRecord(key, {
+      status: null,
+      flaggedAt: null,
+      parsedAt: null,
+      ...(clearOpened ? { lastOpenedAt: null } : {}),
+    });
   }
 
   function safeDecode(value) {
@@ -280,13 +292,13 @@
     const record = getRecord(identity.key);
 
     if (record?.status === 'parsed') {
-      const reset = confirm('Questo articolo risulta gia parsato. Vuoi togliere il check e azzerare lo stato?');
-      if (reset) deleteRecord(identity.key);
+      const reset = confirm('Questo articolo risulta gia parsato. Vuoi togliere il check e azzerare lo stato? La nota verra mantenuta.');
+      if (reset) clearProductState(identity.key, { clearOpened: true });
       return;
     }
 
     if (record?.status === 'flagged') {
-      deleteRecord(identity.key);
+      clearProductState(identity.key);
       return;
     }
 
@@ -369,6 +381,30 @@
     }
   }
 
+  function mountCardNote(card, identity) {
+    let note = card.querySelector(`:scope > [${UI_ATTR}="card-note"]`);
+
+    if (!note) {
+      note = document.createElement('div');
+      note.setAttribute(UI_ATTR, 'card-note');
+      note.className = 'ap-card-note ap-card-note-empty';
+      card.appendChild(note);
+    }
+
+    note.dataset.key = identity.key;
+    updateCardNote(note, identity.key);
+  }
+
+  function updateCardNote(note, key) {
+    const record = getRecord(key);
+    const text = String(record?.note || '').trim();
+
+    note.classList.toggle('ap-card-note-empty', !text);
+    note.textContent = text ? `NOTA · ${text}` : '';
+    note.title = text;
+    note.setAttribute('aria-label', text ? `Nota prodotto: ${text}` : '');
+  }
+
   function collectCards() {
     const visibleKeys = new Set();
     const mountedCards = new WeakSet();
@@ -397,6 +433,7 @@
       visibleKeys.add(identity.key);
       card.setAttribute(CARD_ATTR, identity.key);
       mountCheckbox(card, identity);
+      mountCardNote(card, identity);
     }
 
     return visibleKeys;
@@ -426,6 +463,7 @@
     let flagged = 0;
     let viewed = 0;
     let fresh = 0;
+    let noted = 0;
 
     for (const key of keys) {
       const record = getRecord(key);
@@ -433,6 +471,8 @@
       else if (record?.status === 'flagged') flagged += 1;
       else if (record?.lastOpenedAt) viewed += 1;
       else fresh += 1;
+
+      if (String(record?.note || '').trim()) noted += 1;
     }
 
     state.toolbar.innerHTML = `
@@ -442,6 +482,7 @@
       <span class="ap-tb-flagged">✓ ${flagged} flag</span>
       <span>● ${viewed} viste</span>
       <span>□ ${fresh} nuove</span>
+      <span class="ap-tb-noted">Note ${noted}</span>
     `;
   }
 
@@ -509,6 +550,11 @@
       </label>
       <button type="button" class="ap-panel-parsed" data-action="parsed">✓ Segna come parsato</button>
       <button type="button" class="ap-panel-reset" data-action="reset">Azzera stato</button>
+      <div class="ap-panel-note-separator"></div>
+      <label class="ap-panel-note-label" for="ap-product-note">Nota prodotto</label>
+      <textarea id="ap-product-note" class="ap-panel-note" data-action="note" placeholder="Es. buon margine, packaging debole, da confrontare...">${escapeHtml(record?.note || '')}</textarea>
+      <div class="ap-panel-note-help">La nota viene mostrata anche sulle schede prodotto.</div>
+      <button type="button" class="ap-panel-note-save" data-action="save-note">Salva nota</button>
     `;
 
     state.panel.querySelector('[data-action="flag"]').addEventListener('change', () => {
@@ -528,7 +574,27 @@
     });
 
     state.panel.querySelector('[data-action="reset"]').addEventListener('click', () => {
-      deleteRecord(identity.key);
+      clearProductState(identity.key, { clearOpened: true });
+    });
+
+    const noteInput = state.panel.querySelector('[data-action="note"]');
+    const saveNote = () => {
+      patchRecord(identity.key, {
+        productId: identity.productId,
+        href: location.href,
+        title: document.querySelector('h1')?.textContent?.trim() || record?.title || '',
+        identityFallback: identity.fallback,
+        note: noteInput.value.trim(),
+        noteUpdatedAt: Date.now(),
+      });
+    };
+
+    state.panel.querySelector('[data-action="save-note"]').addEventListener('click', saveNote);
+    noteInput.addEventListener('keydown', (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+        event.preventDefault();
+        saveNote();
+      }
     });
   }
 
@@ -566,6 +632,9 @@
     document.querySelectorAll(`[${UI_ATTR}="card-check"]`).forEach((control) => {
       if (control.dataset.key) updateCheckbox(control, control.dataset.key);
     });
+    document.querySelectorAll(`[${UI_ATTR}="card-note"]`).forEach((note) => {
+      if (note.dataset.key) updateCardNote(note, note.dataset.key);
+    });
     renderToolbar();
     renderProductPanel();
   }
@@ -601,7 +670,7 @@
   }
 
   function resetRegistry() {
-    if (!confirm('Cancellare TUTTI gli stati salvati da Ali Parser?')) return;
+    if (!confirm('Cancellare TUTTI gli stati e TUTTE le note salvate da Ali Parser?')) return;
     GM_deleteValue(STORE_KEY);
     refreshUi();
   }
@@ -642,6 +711,30 @@
       .ap-checkmark { display: block !important; font-size: 19px !important; line-height: 1 !important; color: currentColor !important; }
       .ap-card-label { display: block !important; font-size: 10px !important; letter-spacing: .2px !important; color: currentColor !important; }
 
+      .ap-card-note {
+        position: absolute !important;
+        top: 50px !important;
+        right: 8px !important;
+        z-index: 2147482999 !important;
+        max-width: min(230px, calc(100% - 16px)) !important;
+        box-sizing: border-box !important;
+        padding: 6px 8px !important;
+        border: 1px solid #b68a00 !important;
+        border-radius: 7px !important;
+        background: rgba(255,246,190,.97) !important;
+        color: #3c3100 !important;
+        box-shadow: 0 2px 9px rgba(0,0,0,.18) !important;
+        font: 700 11px/1.3 Arial, sans-serif !important;
+        white-space: normal !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        display: -webkit-box !important;
+        -webkit-line-clamp: 3 !important;
+        -webkit-box-orient: vertical !important;
+        pointer-events: none !important;
+      }
+      .ap-card-note-empty { display: none !important; }
+
       .ap-toolbar {
         position: fixed !important;
         left: 14px !important;
@@ -660,13 +753,14 @@
       .ap-toolbar strong { font-size: 13px !important; }
       .ap-tb-parsed { color: #7ee2a2 !important; }
       .ap-tb-flagged { color: #ffca78 !important; }
+      .ap-tb-noted { color: #ffe89a !important; }
 
       .ap-product-panel {
         position: fixed !important;
         top: 86px !important;
         right: 18px !important;
         z-index: 2147483646 !important;
-        width: 230px !important;
+        width: 260px !important;
         box-sizing: border-box !important;
         padding: 13px !important;
         border: 2px solid #111 !important;
@@ -706,6 +800,23 @@
       }
       .ap-panel-parsed { border: 0 !important; background: #16813f !important; color: #fff !important; }
       .ap-panel-reset { border: 1px solid #bbb !important; background: #fff !important; color: #444 !important; }
+      .ap-panel-note-separator { height: 1px !important; margin: 13px 0 11px !important; background: #ddd !important; }
+      .ap-panel-note-label { display: block !important; margin-bottom: 5px !important; font-weight: 800 !important; }
+      .ap-panel-note {
+        width: 100% !important;
+        min-height: 86px !important;
+        box-sizing: border-box !important;
+        padding: 8px 9px !important;
+        border: 1px solid #aaa !important;
+        border-radius: 7px !important;
+        background: #fffdf1 !important;
+        color: #111 !important;
+        resize: vertical !important;
+        font: 12px/1.35 Arial, sans-serif !important;
+      }
+      .ap-panel-note:focus { outline: 2px solid #d5a500 !important; outline-offset: 1px !important; }
+      .ap-panel-note-help { margin-top: 5px !important; color: #666 !important; font-size: 10px !important; line-height: 1.3 !important; }
+      .ap-panel-note-save { border: 1px solid #b68a00 !important; background: #fff0a6 !important; color: #382c00 !important; }
     `;
     document.head.appendChild(style);
   }
@@ -736,7 +847,7 @@
 
   GM_addValueChangeListener(STORE_KEY, () => refreshUi());
   GM_registerMenuCommand('Ali Parser: esporta registro JSON', exportRegistry);
-  GM_registerMenuCommand('Ali Parser: azzera tutti gli stati', resetRegistry);
+  GM_registerMenuCommand('Ali Parser: cancella registro (stati + note)', resetRegistry);
 
   installStyles();
   installNavigationGuard();
